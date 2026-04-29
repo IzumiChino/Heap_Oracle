@@ -186,8 +186,8 @@ fn render_chunk(ui: &mut egui::Ui, chunk: &ChunkRecord) {
 	ui.horizontal(|ui| {
 		ui.colored_label(color, RichText::new(block_for_state(chunk.state)).strong());
 		ui.monospace(format!(
-			"{:#014x} [{:#06x}] {}{}{}",
-			chunk.addr, chunk.size, label, suffix, top_frame
+			"#{:<4} {:#014x} [{:#06x}] {}{}{}",
+			chunk.index, chunk.addr, chunk.size, label, suffix, top_frame
 		));
 	});
 }

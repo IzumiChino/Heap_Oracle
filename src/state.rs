@@ -73,6 +73,7 @@ pub enum ChunkState {
 
 #[derive(Clone, Debug)]
 pub struct ChunkRecord {
+	pub index: usize,
 	pub addr: u64,
 	pub size: usize,
 	pub state: ChunkState,
@@ -93,6 +94,8 @@ pub struct OracleAlert {
 pub struct ApplyResult {
 	pub alert: Option<OracleAlert>,
 	pub bin: Option<BinType>,
+	pub chunk_index: Option<usize>,
+	pub chunk_size: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -110,6 +113,7 @@ pub struct HeapOracle {
 	pub fastbins: [Vec<u64>; FASTBIN_BINS],
 	pub alerts: Vec<OracleAlert>,
 	pub total_events: u64,
+	pub next_index: usize,
 }
 
 impl Default for HeapOracle {
@@ -126,6 +130,7 @@ impl HeapOracle {
 			fastbins: std::array::from_fn(|_| Vec::new()),
 			alerts: Vec::new(),
 			total_events: 0,
+			next_index: 0,
 		}
 	}
 
@@ -178,9 +183,13 @@ impl HeapOracle {
 			.map(|record| record.generation.saturating_add(1))
 			.unwrap_or(0);
 
+		let index = self.next_index;
+		self.next_index += 1;
+
 		self.chunks.insert(
 			addr,
 			ChunkRecord {
+				index,
 				addr,
 				size,
 				state: ChunkState::Allocated,
@@ -191,7 +200,11 @@ impl HeapOracle {
 			},
 		);
 
-		ApplyResult::default()
+		ApplyResult {
+			chunk_index: Some(index),
+			chunk_size: Some(glibc_chunk_size(size)),
+			..ApplyResult::default()
+		}
 	}
 
 	fn apply_free(&mut self, addr: u64, stack: StackTrace, timestamp_ns: u64) -> ApplyResult {
@@ -202,8 +215,8 @@ impl HeapOracle {
 		}
 
 		self.remove_from_bins(addr);
-		match self.chunks.get(&addr).map(|record| (record.state, record.size)) {
-			Some((ChunkState::Allocated, size)) => {
+		match self.chunks.get(&addr).map(|r| (r.state, r.size, r.index)) {
+			Some((ChunkState::Allocated, size, idx)) => {
 				let bin = self.classify_free_bin(size);
 
 				if let Some(record) = self.chunks.get_mut(&addr) {
@@ -214,8 +227,10 @@ impl HeapOracle {
 
 				self.push_bin(addr, bin);
 				result.bin = Some(bin);
+				result.chunk_index = Some(idx);
+				result.chunk_size = Some(glibc_chunk_size(size));
 			}
-			Some((ChunkState::Freed { .. }, _)) | Some((ChunkState::Uaf { .. }, _)) => {
+			Some((ChunkState::Freed { .. } | ChunkState::Uaf { .. }, size, idx)) => {
 				let alert = self.raise_alert(addr, UafReason::DoubleFree, timestamp_ns);
 
 				if let Some(record) = self.chunks.get_mut(&addr) {
@@ -227,13 +242,20 @@ impl HeapOracle {
 				}
 
 				result.alert = Some(alert);
+				result.chunk_index = Some(idx);
+				if size > 0 {
+					result.chunk_size = Some(glibc_chunk_size(size));
+				}
 			}
 			None => {
+				let idx = self.next_index;
+				self.next_index += 1;
 				let alert = self.raise_alert(addr, UafReason::InvalidFree, timestamp_ns);
 
 				self.chunks.insert(
 					addr,
 					ChunkRecord {
+						index: idx,
 						addr,
 						size: 0,
 						state: ChunkState::Uaf {
@@ -246,6 +268,7 @@ impl HeapOracle {
 					},
 				);
 				result.alert = Some(alert);
+				result.chunk_index = Some(idx);
 			}
 		}
 
@@ -301,6 +324,8 @@ impl HeapOracle {
 		if result.alert.is_none() {
 			result.alert = alloc_result.alert;
 		}
+		result.chunk_index = alloc_result.chunk_index;
+		result.chunk_size = alloc_result.chunk_size;
 
 		result
 	}
@@ -369,7 +394,7 @@ impl HeapOracle {
 ///   (req + 8 + 15) & ~15  =  (req + 23) & ~15
 ///
 /// The minimum chunk is MINSIZE = 4 * SIZE_SZ = 32 = 0x20.
-fn glibc_chunk_size(size: usize) -> usize {
+pub fn glibc_chunk_size(size: usize) -> usize {
 	// SIZE_SZ = 8, MALLOC_ALIGN_MASK = 15
 	let aligned = (size.saturating_add(8 + 15)) & !15usize;
 	aligned.max(0x20)

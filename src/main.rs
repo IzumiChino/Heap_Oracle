@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ipc::{EventKind, HeapEvent, SharedRing};
-use state::{ApplyResult, HeapOracle};
+use state::{ApplyResult, ChunkState, HeapOracle, glibc_chunk_size};
 
 const READER_BATCH_SIZE: usize = 128;
 const READER_IDLE_MS: u64 = 8;
@@ -119,8 +119,8 @@ fn run() -> Result<(), String> {
         Mode::Run {
             command,
             hook_library,
-        } => run_target_mode(command, &hook_library, &options.shm_name, options.no_ui, options.main_only, oracle, stats, stop, reader),
-        Mode::Monitor => run_monitor_mode(options.no_ui, oracle, stats, stop, reader),
+        } => run_target_mode(command, &hook_library, &options.shm_name, options.no_ui, options.main_only, options.use_color, oracle, stats, stop, reader),
+        Mode::Monitor => run_monitor_mode(options.no_ui, options.use_color, oracle, stats, stop, reader),
     }
 }
 
@@ -130,6 +130,7 @@ fn run_target_mode(
     shm_name: &str,
     no_ui: bool,
     main_only: bool,
+    use_color: bool,
     oracle: Arc<RwLock<HeapOracle>>,
     stats: Arc<RuntimeStats>,
     stop: Arc<AtomicBool>,
@@ -142,6 +143,7 @@ fn run_target_mode(
         drain_after_exit(&stats);
         stop.store(true, Ordering::Release);
         let _ = reader.join();
+        print_heap_state(&oracle, use_color);
         print_summary(&oracle, &stats);
         if status != 0 {
             return Err(format!("target exited with status {status}"));
@@ -176,6 +178,7 @@ fn run_target_mode(
 
 fn run_monitor_mode(
     no_ui: bool,
+    use_color: bool,
     oracle: Arc<RwLock<HeapOracle>>,
     stats: Arc<RuntimeStats>,
     stop: Arc<AtomicBool>,
@@ -183,15 +186,11 @@ fn run_monitor_mode(
 ) -> Result<(), String> {
     if no_ui {
         eprintln!("heap-oracle: monitoring without UI, press Ctrl-C to stop");
-        // Loop until the stop flag is raised (e.g., by a future signal
-        // handler) so that the reader thread can be joined cleanly.
-        // Without a ctrlc handler wired up, Ctrl-C will SIGKILL the
-        // process and the OS cleans up; but if stop is ever set via
-        // another code path the shutdown here will be orderly.
         while !stop.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(500));
         }
         let _ = reader.join();
+        print_heap_state(&oracle, use_color);
         print_summary(&oracle, &stats);
         return Ok(());
     }
@@ -245,7 +244,9 @@ fn spawn_reader_thread(
                 for event in batch.iter().copied() {
                     let result = oracle.apply_event(event);
                     if cli_trace {
-                        lines.push(format_event_line(event, result, use_color));
+                        if let Some(line) = format_event_line(event, result, use_color) {
+                            lines.push(line);
+                        }
                     }
                 }
             }
@@ -260,53 +261,64 @@ fn spawn_reader_thread(
     })
 }
 
-fn format_event_line(event: HeapEvent, result: ApplyResult, color: bool) -> String {
-    // ANSI escape codes — empty strings when color is off
-    let (g, r, y, c, m, br, dim, rst) = if color {
-        (
-            "\x1b[32m",   // green   — alloc
-            "\x1b[31m",   // red     — free
-            "\x1b[33m",   // yellow  — realloc / sizes
-            "\x1b[36m",   // cyan    — addresses
-            "\x1b[35m",   // magenta — bin info
-            "\x1b[1;91m", // bold bright red — alerts
-            "\x1b[2m",    // dim     — invalid
-            "\x1b[0m",    // reset
-        )
+fn ansi(enabled: bool) -> (&'static str, &'static str, &'static str, &'static str, &'static str, &'static str, &'static str, &'static str) {
+    if enabled {
+        ("\x1b[32m", "\x1b[31m", "\x1b[33m", "\x1b[36m", "\x1b[35m", "\x1b[1;91m", "\x1b[2m", "\x1b[0m")
     } else {
         ("", "", "", "", "", "", "", "")
-    };
+    }
+}
+
+fn format_event_line(event: HeapEvent, result: ApplyResult, color: bool) -> Option<String> {
+    if event.kind() == EventKind::Free && event.addr == 0 {
+        return None;
+    }
+    if event.kind() == EventKind::Invalid {
+        return None;
+    }
+
+    let (g, r, y, c, m, br, dim, rst) = ansi(color);
+    let has_alert = result.alert.is_some();
+
+    let idx = result.chunk_index
+        .map(|i| format!("#{i:<4}"))
+        .unwrap_or_else(|| "??   ".into());
+
+    let cs = result.chunk_size
+        .map(|s| format!(" {dim}(0x{s:x}){rst}"))
+        .unwrap_or_default();
 
     let base = match event.kind() {
         EventKind::Alloc | EventKind::Calloc | EventKind::Memalign => {
+            let pfx = if has_alert { format!("{br}[!]{rst}") } else { format!("{g}[+]{rst}") };
             format!(
-                "{g}[+] {:<8}{rst} size={y}0x{:x}{rst} addr={c}{:#x}{rst}",
-                event.kind().as_str(),
-                event.size,
-                event.addr,
+                "{pfx} {c}{idx}{rst} {:<8} {y}0x{:x}{rst}{cs}  {c}{:#x}{rst}",
+                event.kind().as_str(), event.size, event.addr,
             )
         }
         EventKind::Free => {
-            format!("{r}[-] free    {rst} addr={c}{:#x}{rst}", event.addr)
+            let pfx = if has_alert { format!("{br}[!]{rst}") } else { format!("{r}[-]{rst}") };
+            format!("{pfx} {c}{idx}{rst} free     {c}{:#x}{rst}", event.addr)
         }
         EventKind::Realloc => {
+            let pfx = if has_alert { format!("{br}[!]{rst}") } else { format!("{y}[*]{rst}") };
             format!(
-                "{y}[*] realloc {rst} old={c}{:#x}{rst} new={c}{:#x}{rst} size={y}0x{:x}{rst}",
-                event.aux_addr, event.addr, event.size,
+                "{pfx} {c}{idx}{rst} realloc  {y}0x{:x}{rst}{cs}  {c}{:#x}{rst} {dim}<-{rst} {c}{:#x}{rst}",
+                event.size, event.addr, event.aux_addr,
             )
         }
-        EventKind::Invalid => format!("{dim}[?] invalid event{rst}"),
+        EventKind::Invalid => unreachable!(),
     };
 
     let mut line = base;
     if let Some(bin) = result.bin {
-        line.push_str(&format!(" {m}-> {bin}{rst}"));
+        line.push_str(&format!("  {m}-> {bin}{rst}"));
     }
     if let Some(alert) = result.alert {
-        line.push_str(&format!(" {br}[!] {}{rst}", alert.reason));
+        line.push_str(&format!("  {br}<< {}{rst}", alert.reason));
     }
 
-    line
+    Some(line)
 }
 
 fn spawn_target(command: &[OsString], hook_library: &Path, shm_name: &str, main_only: bool) -> Result<Child, String> {
@@ -372,6 +384,84 @@ fn drain_after_exit(stats: &RuntimeStats) {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn print_heap_state(oracle: &Arc<RwLock<HeapOracle>>, color: bool) {
+    let Ok(oracle) = oracle.read() else { return };
+    if oracle.chunks.is_empty() {
+        return;
+    }
+
+    let (_g, _r, _y, c, m, br, dim, rst) = ansi(color);
+    let sep = "─".repeat(55);
+
+    println!("\n{dim}{sep}{rst}");
+    println!("{c} #     Address          Req     Chunk   State{rst}");
+    println!("{dim}{sep}{rst}");
+
+    let mut chunks: Vec<_> = oracle.chunks.values().collect();
+    chunks.sort_by_key(|ch| ch.index);
+
+    for ch in &chunks {
+        let chunk_size = glibc_chunk_size(ch.size);
+        let (state_color, state_str, detail) = match ch.state {
+            ChunkState::Allocated => (_g, "ALLOC", String::new()),
+            ChunkState::Freed { bin } => (dim, "FREE ", format!("  {m}{bin}{rst}")),
+            ChunkState::Uaf { reason } => (br, "UAF  ", format!("  {br}{reason}{rst}")),
+        };
+        println!(
+            " {c}{:<5}{rst} {:#014x}   {:#06x}   {:#06x}  {state_color}{state_str}{rst}{detail}",
+            format!("#{}", ch.index), ch.addr, ch.size, chunk_size,
+        );
+    }
+
+    let has_bins = oracle.tcache.iter().any(|b| !b.is_empty())
+        || oracle.fastbins.iter().any(|b| !b.is_empty());
+
+    if has_bins {
+        println!("\n{dim}{sep}{rst}");
+        println!("{m} Bin Chains{rst}");
+        println!("{dim}{sep}{rst}");
+
+        for (idx, bin) in oracle.tcache.iter().enumerate() {
+            if bin.is_empty() {
+                continue;
+            }
+            let chain = format_bin_chain(bin, &chunks);
+            println!(" {m}tcache[{idx:02}]{rst} (0x{:x}): {chain}", (idx + 2) * 0x10);
+        }
+
+        for (idx, bin) in oracle.fastbins.iter().enumerate() {
+            if bin.is_empty() {
+                continue;
+            }
+            let chain = format_bin_chain(bin, &chunks);
+            println!(" {m}fastbin[{idx:02}]{rst} (0x{:x}): {chain}", (idx + 2) * 0x10);
+        }
+    }
+
+    if !oracle.alerts.is_empty() {
+        println!("\n{dim}{sep}{rst}");
+        println!("{br} Alerts{rst}");
+        println!("{dim}{sep}{rst}");
+        for alert in &oracle.alerts {
+            println!(" {br}{:#014x}  {}{rst}", alert.addr, alert.reason);
+        }
+    }
+
+    println!("{dim}{sep}{rst}");
+}
+
+fn format_bin_chain(bin: &[u64], chunks: &[&state::ChunkRecord]) -> String {
+    let mut parts = Vec::new();
+    for addr in bin.iter().rev() {
+        if let Some(ch) = chunks.iter().find(|c| c.addr == *addr) {
+            parts.push(format!("#{}", ch.index));
+        } else {
+            parts.push(format!("{addr:#x}"));
+        }
+    }
+    parts.join(" → ")
 }
 
 fn print_summary(oracle: &Arc<RwLock<HeapOracle>>, stats: &RuntimeStats) {
