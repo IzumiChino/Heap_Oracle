@@ -187,10 +187,12 @@ void *malloc(size_t size)
 	if (!atomic_load_explicit(&ho_initialized, memory_order_acquire))
 		ho_try_enable_trace();
 	if (ho_tls_guard)
-		return ho_hooks.malloc_fn ? ho_hooks.malloc_fn(size) : ho_fallback_malloc(size);
+		return ho_hooks.malloc_fn ? ho_hooks.malloc_fn(size)
+					 : ho_fallback_malloc(size);
 
 	ho_tls_guard++;
-	ret = ho_hooks.malloc_fn ? ho_hooks.malloc_fn(size) : ho_fallback_malloc(size);
+	ret = ho_hooks.malloc_fn ? ho_hooks.malloc_fn(size)
+				 : ho_fallback_malloc(size);
 	ho_publish(HO_EVENT_ALLOC, (uint64_t)(uintptr_t)ret, 0, size, 0);
 	ho_tls_guard--;
 
@@ -205,10 +207,12 @@ void *calloc(size_t n, size_t size)
 	if (!atomic_load_explicit(&ho_initialized, memory_order_acquire))
 		ho_try_enable_trace();
 	if (ho_tls_guard)
-		return ho_hooks.calloc_fn ? ho_hooks.calloc_fn(n, size) : ho_fallback_calloc(n, size);
+		return ho_hooks.calloc_fn ? ho_hooks.calloc_fn(n, size)
+					 : ho_fallback_calloc(n, size);
 
 	ho_tls_guard++;
-	ret = ho_hooks.calloc_fn ? ho_hooks.calloc_fn(n, size) : ho_fallback_calloc(n, size);
+	ret = ho_hooks.calloc_fn ? ho_hooks.calloc_fn(n, size)
+				 : ho_fallback_calloc(n, size);
 	if (!__builtin_mul_overflow((uint64_t)n, (uint64_t)size, &total))
 		ho_publish(HO_EVENT_CALLOC, (uint64_t)(uintptr_t)ret, 0, total, n);
 	else
@@ -223,13 +227,19 @@ void free(void *ptr)
 	if (!atomic_load_explicit(&ho_initialized, memory_order_acquire))
 		ho_try_enable_trace();
 	if (ho_tls_guard) {
-		ho_hooks.free_fn ? ho_hooks.free_fn(ptr) : ho_fallback_free(ptr);
+		if (ho_hooks.free_fn)
+			ho_hooks.free_fn(ptr);
+		else
+			ho_fallback_free(ptr);
 		return;
 	}
 
 	ho_tls_guard++;
 	ho_publish(HO_EVENT_FREE, (uint64_t)(uintptr_t)ptr, 0, 0, 0);
-	ho_hooks.free_fn ? ho_hooks.free_fn(ptr) : ho_fallback_free(ptr);
+	if (ho_hooks.free_fn)
+		ho_hooks.free_fn(ptr);
+	else
+		ho_fallback_free(ptr);
 	ho_tls_guard--;
 }
 
@@ -240,10 +250,12 @@ void *realloc(void *ptr, size_t size)
 	if (!atomic_load_explicit(&ho_initialized, memory_order_acquire))
 		ho_try_enable_trace();
 	if (ho_tls_guard)
-		return ho_hooks.realloc_fn ? ho_hooks.realloc_fn(ptr, size) : ho_fallback_realloc(ptr, size);
+		return ho_hooks.realloc_fn ? ho_hooks.realloc_fn(ptr, size)
+					  : ho_fallback_realloc(ptr, size);
 
 	ho_tls_guard++;
-	ret = ho_hooks.realloc_fn ? ho_hooks.realloc_fn(ptr, size) : ho_fallback_realloc(ptr, size);
+	ret = ho_hooks.realloc_fn ? ho_hooks.realloc_fn(ptr, size)
+				  : ho_fallback_realloc(ptr, size);
 	ho_publish(HO_EVENT_REALLOC, (uint64_t)(uintptr_t)ret,
 		   (uint64_t)(uintptr_t)ptr, size, 0);
 	ho_tls_guard--;
@@ -325,13 +337,24 @@ int __libc_start_main(
 	void (*rtld_fini)(void), void *stack_end)
 {
 	ho_start_main_t real;
+	const char *main_only;
+	int (*entry)(int, char **, char **);
 
-	ho_saved_main = main_fn;
 	real = (ho_start_main_t)dlsym(RTLD_NEXT, "__libc_start_main");
 	if (!real)
 		_exit(127);
-	return real(ho_main_wrapper, argc, argv, init, fini, rtld_fini,
-		    stack_end);
+
+	main_only = getenv("HEAP_ORACLE_MAIN_ONLY");
+	if (main_only && main_only[0] == '1') {
+		ho_saved_main = main_fn;
+		entry = ho_main_wrapper;
+	} else {
+		atomic_store_explicit(&ho_main_entered, 1,
+				      memory_order_release);
+		entry = main_fn;
+	}
+
+	return real(entry, argc, argv, init, fini, rtld_fini, stack_end);
 }
 
 #endif /* __linux__ */

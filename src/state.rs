@@ -376,11 +376,13 @@ impl HeapOracle {
 		for bin in &mut self.tcache {
 			if let Some(pos) = bin.iter().position(|entry| *entry == addr) {
 				bin.remove(pos);
+				return;
 			}
 		}
 		for bin in &mut self.fastbins {
 			if let Some(pos) = bin.iter().position(|entry| *entry == addr) {
 				bin.remove(pos);
+				return;
 			}
 		}
 	}

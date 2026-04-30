@@ -7,7 +7,7 @@ use std::env;
 use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -145,8 +145,8 @@ fn run_target_mode(
         let _ = reader.join();
         print_heap_state(&oracle, use_color);
         print_summary(&oracle, &stats);
-        if status != 0 {
-            return Err(format!("target exited with status {status}"));
+        if !status.success() {
+            eprintln!("heap-oracle: target {}", format_exit_status(&status));
         }
         return Ok(());
     }
@@ -298,7 +298,7 @@ fn format_event_line(event: HeapEvent, result: ApplyResult, color: bool) -> Opti
         }
         EventKind::Free => {
             let pfx = if has_alert { format!("{br}[!]{rst}") } else { format!("{r}[-]{rst}") };
-            format!("{pfx} {c}{idx}{rst} free     {c}{:#x}{rst}", event.addr)
+            format!("{pfx} {c}{idx}{rst} free    {cs}  {c}{:#x}{rst}", event.addr)
         }
         EventKind::Realloc => {
             let pfx = if has_alert { format!("{br}[!]{rst}") } else { format!("{y}[*]{rst}") };
@@ -360,33 +360,65 @@ fn spawn_target(command: &[OsString], hook_library: &Path, shm_name: &str, main_
         .map_err(|err| format!("failed to launch target: {err}"))
 }
 
-fn wait_for_child(mut child: Child, stats: &RuntimeStats) -> Result<i32, String> {
+fn wait_for_child(mut child: Child, stats: &RuntimeStats) -> Result<ExitStatus, String> {
     let status = child
         .wait()
         .map_err(|err| format!("failed to wait for target: {err}"))?;
     let code = status.code().unwrap_or(-1);
     stats.mark_target_exit(code);
-    Ok(code)
+    Ok(status)
+}
+
+fn format_exit_status(status: &ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exited with status {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            let name = match sig {
+                6 => "SIGABRT",
+                11 => "SIGSEGV",
+                4 => "SIGILL",
+                8 => "SIGFPE",
+                9 => "SIGKILL",
+                15 => "SIGTERM",
+                _ => "",
+            };
+            return if name.is_empty() {
+                format!("killed by signal {sig}")
+            } else {
+                format!("killed by {name} (signal {sig})")
+            };
+        }
+    }
+    format!("exited (unknown status)")
 }
 
 fn drain_after_exit(stats: &RuntimeStats) {
     let mut stable = 0usize;
+    let mut last_consumed = stats.snapshot().consumed;
 
     for _ in 0..50 {
-        let pending = stats.snapshot().pending;
-        if pending == 0 {
+        let snap = stats.snapshot();
+        let idle = snap.pending == 0 && snap.consumed == last_consumed;
+        if idle {
             stable += 1;
-            if stable >= 2 {
+            if stable >= 3 {
                 break;
             }
         } else {
             stable = 0;
         }
+        last_consumed = snap.consumed;
         thread::sleep(Duration::from_millis(20));
     }
 }
 
 fn print_heap_state(oracle: &Arc<RwLock<HeapOracle>>, color: bool) {
+    use std::collections::HashMap;
+
     let Ok(oracle) = oracle.read() else { return };
     if oracle.chunks.is_empty() {
         return;
@@ -401,6 +433,8 @@ fn print_heap_state(oracle: &Arc<RwLock<HeapOracle>>, color: bool) {
 
     let mut chunks: Vec<_> = oracle.chunks.values().collect();
     chunks.sort_by_key(|ch| ch.index);
+
+    let addr_to_index: HashMap<u64, usize> = chunks.iter().map(|ch| (ch.addr, ch.index)).collect();
 
     for ch in &chunks {
         let chunk_size = glibc_chunk_size(ch.size);
@@ -427,7 +461,7 @@ fn print_heap_state(oracle: &Arc<RwLock<HeapOracle>>, color: bool) {
             if bin.is_empty() {
                 continue;
             }
-            let chain = format_bin_chain(bin, &chunks);
+            let chain = format_bin_chain(bin, &addr_to_index);
             println!(" {m}tcache[{idx:02}]{rst} (0x{:x}): {chain}", (idx + 2) * 0x10);
         }
 
@@ -435,7 +469,7 @@ fn print_heap_state(oracle: &Arc<RwLock<HeapOracle>>, color: bool) {
             if bin.is_empty() {
                 continue;
             }
-            let chain = format_bin_chain(bin, &chunks);
+            let chain = format_bin_chain(bin, &addr_to_index);
             println!(" {m}fastbin[{idx:02}]{rst} (0x{:x}): {chain}", (idx + 2) * 0x10);
         }
     }
@@ -452,11 +486,11 @@ fn print_heap_state(oracle: &Arc<RwLock<HeapOracle>>, color: bool) {
     println!("{dim}{sep}{rst}");
 }
 
-fn format_bin_chain(bin: &[u64], chunks: &[&state::ChunkRecord]) -> String {
+fn format_bin_chain(bin: &[u64], addr_to_index: &std::collections::HashMap<u64, usize>) -> String {
     let mut parts = Vec::new();
     for addr in bin.iter().rev() {
-        if let Some(ch) = chunks.iter().find(|c| c.addr == *addr) {
-            parts.push(format!("#{}", ch.index));
+        if let Some(idx) = addr_to_index.get(addr) {
+            parts.push(format!("#{idx}"));
         } else {
             parts.push(format!("{addr:#x}"));
         }
