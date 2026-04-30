@@ -44,6 +44,7 @@ static _Atomic int ho_init_once;
  */
 static _Atomic int ho_main_entered;
 static int ho_filter_pre_main;
+static int ho_capture_stack = 1;
 #if defined(__linux__)
 static int (*ho_saved_main)(int, char **, char **);
 #endif
@@ -110,12 +111,14 @@ static void ho_fill_event(struct ho_event *event, uint16_t kind, uint64_t addr,
 	event->tid = ho_platform_thread_id();
 	event->timestamp_ns = ho_platform_timestamp_ns();
 
-	depth = ho_platform_capture_callstack(event->callstack, HO_STACK_DEPTH);
-	event->stack_len = depth;
-	if (depth)
-		event->flags |= HO_EVENT_FLAG_STACK_VALID;
-	if (depth >= HO_STACK_DEPTH)
-		event->flags |= HO_EVENT_FLAG_STACK_TRUNCATED;
+	if (ho_capture_stack) {
+		depth = ho_platform_capture_callstack(event->callstack, HO_STACK_DEPTH);
+		event->stack_len = depth;
+		if (depth)
+			event->flags |= HO_EVENT_FLAG_STACK_VALID;
+		if (depth >= HO_STACK_DEPTH)
+			event->flags |= HO_EVENT_FLAG_STACK_TRUNCATED;
+	}
 }
 
 static void ho_publish(uint16_t kind, uint64_t addr, uint64_t aux_addr,
@@ -162,6 +165,11 @@ static void ho_try_enable_trace(void)
 		const char *main_only = getenv("HEAP_ORACLE_MAIN_ONLY");
 		if (main_only && main_only[0] == '1')
 			ho_filter_pre_main = 1;
+	}
+	{
+		const char *no_stack = getenv("HEAP_ORACLE_NO_STACK");
+		if (no_stack && no_stack[0] == '1')
+			ho_capture_stack = 0;
 	}
 	name = getenv("HEAP_ORACLE_SHM_NAME");
 	if (name && !ho_platform_open_writer(&ho_platform, name))

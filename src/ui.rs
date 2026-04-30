@@ -210,9 +210,9 @@ fn format_chain(bin: &[u64]) -> String {
 
 fn block_for_state(state: ChunkState) -> &'static str {
 	match state {
-		ChunkState::Allocated => "██",
-		ChunkState::Freed { .. } => "░░",
-		ChunkState::Uaf { .. } => "!!",
+		ChunkState::Allocated => "[+][+]",
+		ChunkState::Freed { .. } => "[-][-]",
+		ChunkState::Uaf { .. } => "[!][!]",
 	}
 }
 

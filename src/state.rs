@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use crate::ipc::{EventKind, HeapEvent, STACK_DEPTH};
@@ -107,6 +107,12 @@ pub struct OracleSummary {
 	pub alerts: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BinLocation {
+	Tcache(usize),
+	Fastbin(usize),
+}
+
 pub struct HeapOracle {
 	pub chunks: BTreeMap<u64, ChunkRecord>,
 	pub tcache: [Vec<u64>; TCACHE_BINS],
@@ -114,6 +120,8 @@ pub struct HeapOracle {
 	pub alerts: Vec<OracleAlert>,
 	pub total_events: u64,
 	pub next_index: usize,
+	counts: [usize; 3],
+	bin_index: HashMap<u64, BinLocation>,
 }
 
 impl Default for HeapOracle {
@@ -131,6 +139,8 @@ impl HeapOracle {
 			alerts: Vec::new(),
 			total_events: 0,
 			next_index: 0,
+			counts: [0; 3],
+			bin_index: HashMap::new(),
 		}
 	}
 
@@ -148,21 +158,20 @@ impl HeapOracle {
 	}
 
 	pub fn summary(&self) -> OracleSummary {
-		let mut summary = OracleSummary {
+		OracleSummary {
 			total_chunks: self.chunks.len(),
+			allocated: self.counts[0],
+			freed: self.counts[1],
+			uaf: self.counts[2],
 			alerts: self.alerts.len(),
-			..OracleSummary::default()
-		};
-
-		for record in self.chunks.values() {
-			match record.state {
-				ChunkState::Allocated => summary.allocated += 1,
-				ChunkState::Freed { .. } => summary.freed += 1,
-				ChunkState::Uaf { .. } => summary.uaf += 1,
-			}
 		}
+	}
 
-		summary
+	fn count_state_change(&mut self, old: Option<ChunkState>, new: ChunkState) {
+		if let Some(old) = old {
+			self.counts[state_index(old)] -= 1;
+		}
+		self.counts[state_index(new)] += 1;
 	}
 
 	fn apply_alloc(
@@ -177,6 +186,7 @@ impl HeapOracle {
 		}
 
 		self.remove_from_bins(addr);
+		let old_state = self.chunks.get(&addr).map(|r| r.state);
 		let next_generation = self
 			.chunks
 			.get(&addr)
@@ -186,6 +196,7 @@ impl HeapOracle {
 		let index = self.next_index;
 		self.next_index += 1;
 
+		self.count_state_change(old_state, ChunkState::Allocated);
 		self.chunks.insert(
 			addr,
 			ChunkRecord {
@@ -218,9 +229,11 @@ impl HeapOracle {
 		match self.chunks.get(&addr).map(|r| (r.state, r.size, r.index)) {
 			Some((ChunkState::Allocated, size, idx)) => {
 				let bin = self.classify_free_bin(size);
+				let new_state = ChunkState::Freed { bin };
 
+				self.count_state_change(Some(ChunkState::Allocated), new_state);
 				if let Some(record) = self.chunks.get_mut(&addr) {
-					record.state = ChunkState::Freed { bin };
+					record.state = new_state;
 					record.free_stack = Some(stack);
 					record.last_event_ns = timestamp_ns;
 				}
@@ -230,13 +243,13 @@ impl HeapOracle {
 				result.chunk_index = Some(idx);
 				result.chunk_size = Some(glibc_chunk_size(size));
 			}
-			Some((ChunkState::Freed { .. } | ChunkState::Uaf { .. }, size, idx)) => {
+			Some((old @ (ChunkState::Freed { .. } | ChunkState::Uaf { .. }), size, idx)) => {
+				let new_state = ChunkState::Uaf { reason: UafReason::DoubleFree };
 				let alert = self.raise_alert(addr, UafReason::DoubleFree, timestamp_ns);
 
+				self.count_state_change(Some(old), new_state);
 				if let Some(record) = self.chunks.get_mut(&addr) {
-					record.state = ChunkState::Uaf {
-						reason: UafReason::DoubleFree,
-					};
+					record.state = new_state;
 					record.free_stack = Some(stack);
 					record.last_event_ns = timestamp_ns;
 				}
@@ -250,17 +263,17 @@ impl HeapOracle {
 			None => {
 				let idx = self.next_index;
 				self.next_index += 1;
+				let new_state = ChunkState::Uaf { reason: UafReason::InvalidFree };
 				let alert = self.raise_alert(addr, UafReason::InvalidFree, timestamp_ns);
 
+				self.count_state_change(None, new_state);
 				self.chunks.insert(
 					addr,
 					ChunkRecord {
 						index: idx,
 						addr,
 						size: 0,
-						state: ChunkState::Uaf {
-							reason: UafReason::InvalidFree,
-						},
+						state: new_state,
 						alloc_stack: StackTrace::default(),
 						free_stack: Some(stack),
 						last_event_ns: timestamp_ns,
@@ -295,26 +308,24 @@ impl HeapOracle {
 
 		self.remove_from_bins(old_addr);
 		match self.chunks.get(&old_addr).map(|record| record.state) {
-			Some(ChunkState::Allocated) => {
+			Some(old @ ChunkState::Allocated) => {
+				let new_state = ChunkState::Freed { bin: BinType::Reallocated };
+				self.count_state_change(Some(old), new_state);
 				if let Some(record) = self.chunks.get_mut(&old_addr) {
-					record.state = ChunkState::Freed {
-						bin: BinType::Reallocated,
-					};
+					record.state = new_state;
 					record.free_stack = Some(stack);
 					record.last_event_ns = timestamp_ns;
 				}
 			}
-			Some(ChunkState::Freed { .. }) | Some(ChunkState::Uaf { .. }) => {
+			Some(old @ (ChunkState::Freed { .. } | ChunkState::Uaf { .. })) => {
+				let new_state = ChunkState::Uaf { reason: UafReason::ReallocOfFreed };
 				let alert = self.raise_alert(old_addr, UafReason::ReallocOfFreed, timestamp_ns);
-
+				self.count_state_change(Some(old), new_state);
 				if let Some(record) = self.chunks.get_mut(&old_addr) {
-					record.state = ChunkState::Uaf {
-						reason: UafReason::ReallocOfFreed,
-					};
+					record.state = new_state;
 					record.free_stack = Some(stack);
 					record.last_event_ns = timestamp_ns;
 				}
-
 				result.alert = Some(alert);
 			}
 			None => {}
@@ -366,24 +377,26 @@ impl HeapOracle {
 
 	fn push_bin(&mut self, addr: u64, bin: BinType) {
 		match bin {
-			BinType::Tcache(idx) if idx < self.tcache.len() => self.tcache[idx].push(addr),
-			BinType::Fastbin(idx) if idx < self.fastbins.len() => self.fastbins[idx].push(addr),
+			BinType::Tcache(idx) if idx < self.tcache.len() => {
+				self.tcache[idx].push(addr);
+				self.bin_index.insert(addr, BinLocation::Tcache(idx));
+			}
+			BinType::Fastbin(idx) if idx < self.fastbins.len() => {
+				self.fastbins[idx].push(addr);
+				self.bin_index.insert(addr, BinLocation::Fastbin(idx));
+			}
 			_ => {}
 		}
 	}
 
 	fn remove_from_bins(&mut self, addr: u64) {
-		for bin in &mut self.tcache {
-			if let Some(pos) = bin.iter().position(|entry| *entry == addr) {
-				bin.remove(pos);
-				return;
-			}
-		}
-		for bin in &mut self.fastbins {
-			if let Some(pos) = bin.iter().position(|entry| *entry == addr) {
-				bin.remove(pos);
-				return;
-			}
+		let Some(loc) = self.bin_index.remove(&addr) else { return };
+		let bin = match loc {
+			BinLocation::Tcache(idx) => &mut self.tcache[idx],
+			BinLocation::Fastbin(idx) => &mut self.fastbins[idx],
+		};
+		if let Some(pos) = bin.iter().position(|entry| *entry == addr) {
+			bin.remove(pos);
 		}
 	}
 }
@@ -420,4 +433,12 @@ fn fastbin_index(chunk_size: usize) -> Option<usize> {
 
 	let idx = (chunk_size - 0x20) / 0x10;
 	(idx < FASTBIN_BINS).then_some(idx)
+}
+
+fn state_index(state: ChunkState) -> usize {
+	match state {
+		ChunkState::Allocated => 0,
+		ChunkState::Freed { .. } => 1,
+		ChunkState::Uaf { .. } => 2,
+	}
 }

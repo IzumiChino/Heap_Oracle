@@ -73,6 +73,7 @@ struct Options {
     shm_name: String,
     no_ui: bool,
     main_only: bool,
+    no_stack: bool,
     use_color: bool,
 }
 
@@ -119,7 +120,7 @@ fn run() -> Result<(), String> {
         Mode::Run {
             command,
             hook_library,
-        } => run_target_mode(command, &hook_library, &options.shm_name, options.no_ui, options.main_only, options.use_color, oracle, stats, stop, reader),
+        } => run_target_mode(command, &hook_library, &options.shm_name, options.no_ui, options.main_only, options.no_stack, options.use_color, oracle, stats, stop, reader),
         Mode::Monitor => run_monitor_mode(options.no_ui, options.use_color, oracle, stats, stop, reader),
     }
 }
@@ -130,13 +131,14 @@ fn run_target_mode(
     shm_name: &str,
     no_ui: bool,
     main_only: bool,
+    no_stack: bool,
     use_color: bool,
     oracle: Arc<RwLock<HeapOracle>>,
     stats: Arc<RuntimeStats>,
     stop: Arc<AtomicBool>,
     reader: thread::JoinHandle<()>,
 ) -> Result<(), String> {
-    let child = spawn_target(&command, hook_library, shm_name, main_only)?;
+    let child = spawn_target(&command, hook_library, shm_name, main_only, no_stack)?;
 
     if no_ui {
         let status = wait_for_child(child, &stats)?;
@@ -239,22 +241,22 @@ fn spawn_reader_thread(
                 continue;
             }
 
-            let mut lines = Vec::new();
+            let mut results: Vec<(HeapEvent, ApplyResult)> = Vec::new();
             if let Ok(mut oracle) = oracle.write() {
                 for event in batch.iter().copied() {
                     let result = oracle.apply_event(event);
                     if cli_trace {
-                        if let Some(line) = format_event_line(event, result, use_color) {
-                            lines.push(line);
-                        }
+                        results.push((event, result));
                     }
                 }
             }
 
             stats.add_consumed(count);
             if cli_trace {
-                for line in lines {
-                    println!("{line}");
+                for (event, result) in results {
+                    if let Some(line) = format_event_line(event, result, use_color) {
+                        println!("{line}");
+                    }
                 }
             }
         }
@@ -321,7 +323,7 @@ fn format_event_line(event: HeapEvent, result: ApplyResult, color: bool) -> Opti
     Some(line)
 }
 
-fn spawn_target(command: &[OsString], hook_library: &Path, shm_name: &str, main_only: bool) -> Result<Child, String> {
+fn spawn_target(command: &[OsString], hook_library: &Path, shm_name: &str, main_only: bool, no_stack: bool) -> Result<Child, String> {
     if command.is_empty() {
         return Err(String::from("missing target command"));
     }
@@ -350,6 +352,9 @@ fn spawn_target(command: &[OsString], hook_library: &Path, shm_name: &str, main_
     child.env("HEAP_ORACLE_SHM_NAME", shm_name);
     if main_only {
         child.env("HEAP_ORACLE_MAIN_ONLY", "1");
+    }
+    if no_stack {
+        child.env("HEAP_ORACLE_NO_STACK", "1");
     }
     if cfg!(target_os = "macos") {
         child.env("DYLD_FORCE_FLAT_NAMESPACE", "1");
@@ -535,6 +540,7 @@ fn parse_args() -> Result<ParseResult, String> {
     let mut no_ui = false;
     let mut main_only = false;
     let mut no_color = false;
+    let mut no_stack = false;
     let mut shm_name = generate_shm_name();
     let mut hook_library = None;
 
@@ -557,6 +563,10 @@ fn parse_args() -> Result<ParseResult, String> {
                 }
                 if arg == "--no-color" {
                     no_color = true;
+                    continue;
+                }
+                if arg == "--no-stack" {
+                    no_stack = true;
                     continue;
                 }
                 if arg == "--shm-name" {
@@ -583,6 +593,7 @@ fn parse_args() -> Result<ParseResult, String> {
                 shm_name,
                 no_ui,
                 main_only,
+                no_stack,
                 use_color: !no_color && std::io::stdout().is_terminal(),
             }))
         }
@@ -609,6 +620,7 @@ fn parse_args() -> Result<ParseResult, String> {
                 shm_name,
                 no_ui,
                 main_only: false,
+                no_stack: false,
                 use_color: !no_color && std::io::stdout().is_terminal(),
             }))
         }
@@ -676,6 +688,7 @@ Options:
   --no-ui        CLI-only mode (no GUI window)
   --no-color     Disable ANSI colour output
   --main-only    Only trace events after main() starts (skip libc init noise)
+  --no-stack     Disable callstack capture (faster, smaller events)
   --shm-name N   Override shared-memory name
   --hook-lib P   Override hook library path
 
