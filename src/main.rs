@@ -500,7 +500,7 @@ fn format_bin_chain(bin: &[u64], addr_to_index: &std::collections::HashMap<u64, 
             parts.push(format!("{addr:#x}"));
         }
     }
-    parts.join(" → ")
+    parts.join(" -> ")
 }
 
 fn print_summary(oracle: &Arc<RwLock<HeapOracle>>, stats: &RuntimeStats) {

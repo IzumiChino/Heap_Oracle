@@ -31,7 +31,7 @@ static _Atomic int ho_trace_enabled;
 static __thread unsigned int ho_tls_guard;
 /*
  * One-shot init gate: 0 = not started, 1 = taken.
- * CAS 0→1 to become the sole initialiser thread; all other threads
+ * CAS 0->1 to become the sole initialiser thread; all other threads
  * that lose the race simply skip initialisation and return early.
  * This prevents concurrent writes to the global ho_platform struct.
  */
@@ -320,8 +320,8 @@ void *aligned_alloc(size_t alignment, size_t size)
 /* This lets ho_publish() suppress all init-time allocations when      */
 /* HEAP_ORACLE_MAIN_ONLY=1 is set.                                    */
 /*                                                                    */
-/* Call chain:  _start → our __libc_start_main → real __libc_start_   */
-/* main(ho_main_wrapper, ...) → .init/.ctors → ho_main_wrapper →      */
+/* Call chain:  _start -> our __libc_start_main -> real __libc_start_   */
+/* main(ho_main_wrapper, ...) -> .init/.ctors -> ho_main_wrapper ->      */
 /* real main().                                                        */
 /* ------------------------------------------------------------------ */
 #if defined(__linux__)
